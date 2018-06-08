@@ -20,12 +20,14 @@ def make_batch(iterable, batch_size=1):
     #       LC = Lobular Carcinoma
     #       MC = Mucinous Carcinoma (Colloid)
     #       PC = Papillary Carcinoma
+
+
 class CancerDataset(object):
     """ Cancer dataset reader """
 
-    def __init__(self, data_dir="/home/murilo/dataset/BreaKHis_v1/", test_size=0.3, dataset_name="img40",
-                 nr_classes=2, randon_state=None):
-        data_dir = os.path.join(data_dir, dataset_name)
+    def __init__(self, data_dir="/home/murilo/dataset/BreaKHis_v1/folds", split="fold1",
+                 dataset_name="40X", nr_classes=2):
+
         if nr_classes == 2:
             self.categories = {"B": 0, "M": 1}
             class_position = 1
@@ -33,15 +35,26 @@ class CancerDataset(object):
             self.categories = {"A": 0, "F": 1, "TA": 2, "PT": 3, "DC": 4, "LC": 5, "MC": 6, "PC": 7}
             class_position = 2
 
-        # self.image_files = list(glob.glob(os.path.join(data_dir, split, "*.png")))
-        self.image_files = list(glob.glob(os.path.join(data_dir, "*.png")))
-        self.labels = [self.categories.get(os.path.basename(path).strip().replace("-","_").split("_")[class_position], -1)
-                       for path in self.image_files]
+        # Train images and labels
+        self.X_train = list(sorted(glob.glob(os.path.join(data_dir, split, "train", dataset_name, "*.png"))))
+        self.y_train = [
+            self.categories.get(os.path.basename(path).strip().replace("-", "_").split("_")[class_position], -1)
+            for path in self.X_train]
+
+        # test images and labels
+        self.X_test = list(sorted(glob.glob(os.path.join(data_dir, split, "test", dataset_name, "*.png"))))
+        self.y_test = [
+            self.categories.get(os.path.basename(path).strip().replace("-", "_").split("_")[class_position], -1)
+            for path in self.X_test]
+
+        # self.image_files = list(glob.glob(os.path.join(data_dir,split, "*.png")))
+        # self.labels = [self.categories.get(os.path.basename(path).strip().replace("-","_").split("_")[class_position], -1)
+        #               for path in self.image_files]
         # Do dataset split
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.image_files, self.labels,
-                                                                                stratify=self.labels,
-                                                                                test_size=test_size,
-                                                                                random_state=randon_state)
+        # self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.image_files, self.labels,
+        #                                                                        stratify=self.labels,
+        #                                                                        test_size=test_size,
+        #                                                                        random_state=randon_state)
 
     def rescale(self, img, input_height, input_width):
         aspect = img.shape[1] / float(img.shape[0])
@@ -86,7 +99,7 @@ class CancerDataset(object):
         else:
             return len(self.y_test)
 
-    def read(self, batch_size=50, shuffle=False, train=True):
+    def read(self, batch_size=50, shuffle=True, train=True):
         """Read (image, label) pairs in batch"""
         order = list(range(self.len(train)))
         if shuffle:

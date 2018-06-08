@@ -2,6 +2,10 @@ import numpy as np
 from caffe2.python import core, workspace, model_helper, optimizer, brew
 from caffe2.python.modeling import initializers
 from caffe2.python.modeling.parameter_info import ParameterTags
+import caffe2.python.predictor.predictor_exporter as pred_exp
+import caffe2.python.predictor.predictor_py_utils as pred_utils
+from caffe2.python.predictor_constants import predictor_constants \
+    as predictor_constants
 from caffe2.proto import caffe2_pb2
 from cancer_dataset import CancerDataset
 import operator
@@ -61,7 +65,8 @@ def AddTrainingOperators(model, softmax, label):
     loss = model.AveragedLoss(xent, "loss")
     brew.accuracy(model, [softmax, label], "accuracy")
     model.AddGradientOperators([loss])
-    opt = optimizer.build_sgd(model, base_learning_rate=0.1)
+    #opt = optimizer.build_sgd(model, base_learning_rate=0.1)
+    opt = optimizer.build_sgd(model, base_learning_rate=0.04, policy="step", stepsize=1, gamma=0.999, momentum=0.9)
     for param in model.GetOptimizationParamInfo():
         opt(model.net, model.param_init_net, param)
 
@@ -96,7 +101,86 @@ def SetRunGPU(train_model):
     return device_option
 
 
-def Finetuning(dataset, train_model, device_option, epochs, batch_size):
+def GetCheckpointParams(train_model):
+    #prefix = "gpu_{}".format(train_model._devices[0])
+    params = [str(p) for p in train_model.GetParams()]
+    params.extend([str(p) + "_momentum" for p in params])
+    params.extend([str(p) for p in train_model.GetComputedParams()])
+
+    assert len(params) > 0
+    return params
+
+
+def SaveModel(args, train_model, epoch):
+    #prefix = "gpu_{}".format(train_model._devices[0])
+    predictor_export_meta = pred_exp.PredictorExportMeta(
+        predict_net=train_model.net.Proto(),
+        parameters=GetCheckpointParams(train_model),
+        #inputs=["data"],
+        outputs=["softmax"],
+        shapes={
+            "softmax": (1, args.nr_classes),
+            "data": (3, 227, 227)
+        }
+    )
+
+    # save the train_model for the current epoch
+    model_path = "%s/%s_%d.mdl" % (
+        os.path.join(args.output_dir, args.experiment_name),
+        args.model_name,
+        epoch,
+    )
+
+    # save the model
+    pred_exp.save_to_db(
+        db_type='minidb',
+        db_destination=model_path,
+        predictor_export_meta=predictor_export_meta,
+    )
+
+def LoadModel(path, dbtype='minidb'):
+    '''
+    Load pretrained model from file
+    '''
+    log.info("Loading path: {}".format(path))
+    meta_net_def = pred_exp.load_from_db(path, dbtype)
+    init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.GLOBAL_INIT_NET_TYPE))
+    predict_init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.PREDICT_INIT_NET_TYPE))
+
+    predict_init_net.RunAllOnGPU()
+    init_net.RunAllOnGPU()
+    assert workspace.RunNetOnce(predict_init_net)
+    assert workspace.RunNetOnce(init_net)
+
+def LoadModel2(path, model):
+    '''
+    Load pretrained model from file
+    '''
+    log.info("Loading path: {}".format(path))
+    meta_net_def = pred_exp.load_from_db(path, 'minidb')
+    init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.GLOBAL_INIT_NET_TYPE))
+    predict_init_net = core.Net(pred_utils.GetNet(
+        meta_net_def, predictor_constants.PREDICT_INIT_NET_TYPE))
+
+    predict_init_net.RunAllOnGPU()
+    init_net.RunAllOnGPU()
+
+    assert workspace.RunNetOnce(predict_init_net)
+    assert workspace.RunNetOnce(init_net)
+
+    # Hack: fix iteration counter which is in CUDA context after load model
+    itercnt = workspace.FetchBlob("optimizer_iteration")
+    workspace.FeedBlob(
+        "optimizer_iteration",
+        itercnt,
+        device_option=core.DeviceOption(caffe2_pb2.CPU, 0)
+    )
+
+
+def Finetuning(dataset, train_model, device_option, args):
     workspace.ResetWorkspace()
     # Initialization
     for image, label, file in dataset.read(batch_size=1):
@@ -109,8 +193,8 @@ def Finetuning(dataset, train_model, device_option, epochs, batch_size):
     # Main loop
     print_freq = 10
     losses = []
-    for epoch in range(epochs):
-        for index, (image, label, file) in enumerate(dataset.read(batch_size)):
+    for epoch in range(args.num_epochs):
+        for index, (image, label, file) in enumerate(dataset.read(args.batch_size)):
             workspace.FeedBlob("data", image, device_option=device_option)
             workspace.FeedBlob("label", label, device_option=device_option)
             workspace.RunNet(train_model.net)
@@ -119,8 +203,10 @@ def Finetuning(dataset, train_model, device_option, epochs, batch_size):
             losses.append(loss)
             if index % print_freq == 0:
                 print("[{}][{}/{}] loss={}, accuracy={}".format(
-                    epoch, index, int(len(dataset.X_train) / batch_size),
+                    epoch, index, int(len(dataset.X_train) / args.batch_size),
                     loss, accuracy))
+        # Save the model for each epoch
+        SaveModel(args, train_model, epoch)
 
     return losses
 
@@ -176,7 +262,11 @@ def TestModel(dataset, deploy_model, device_option, args):
 
     #
     hp = Helpers()
-    class_names = np.array(['Benign', 'Malignant'])
+    if args.nr_classes == 2:
+        class_names = np.array(['Benign', 'Malignant'])
+    else:
+        class_names = np.array(['Adenosis', 'Fibroadenoma', 'Tubular Adenoma', 'Phyllodes Tumor',
+                                'Ductal Carcinoma', 'Lobular Carcinoma', 'Mucinous Carcinoma', 'Papillary Carcinoma'])
     # Plot non-normalized confusion matrix clip
     plt.figure()
     f = os.path.join(args.output_dir, args.experiment_name, 'ConfusionNonNormalized.png')
@@ -232,9 +322,9 @@ def main():
                         help="Predict net file (net with operators")
     parser.add_argument("--init_net", type=str, default='models/squeezenet/init_net.pb',
                         help="Predict net file (net with weights")
-    parser.add_argument("--experiment_name", type=str, default='BreakHis200X',
+    parser.add_argument("--experiment_name", type=str, default='BreakHis40X',
                         help="Name of the experiment")
-    parser.add_argument("--dataset_name", type=str, default='img200',
+    parser.add_argument("--dataset_name", type=str, default='40X',
                         help="Name of the dataset")
     parser.add_argument("--output_dir", type=str, default='/home/murilo/PycharmProjects/BreakHis/results',
                         help="Directory to store outputs")
@@ -246,38 +336,49 @@ def main():
                         help="Batch size, total over all GPUs")
     parser.add_argument("--test_trials", type=int, default=5,
                         help="Number of train/test trial")
-    parser.add_argument("--dataset_shuffle_seeds", type=str, default='159,225,350,487,789',
-                        help="Seeds for shuffle dataset")
+    parser.add_argument("--model_name", type=str, default='squeezenet',
+                        help="Model name")
+    #parser.add_argument("--dataset_shuffle_seeds", type=str, default='159,225,350,487,789',
+    #                    help="Seeds for shuffle dataset")
     args = parser.parse_args()
 
     log.info(args)
     print(args)
 
-    base_experiment_name = args.experiment_name
-    data_set_shuffle_seeds = args.dataset_shuffle_seeds.split(',')
-    for trial in range(args.test_trials):
-        args.experiment_name = base_experiment_name + '_' + str(trial+1)
+    if 1:
+        test_model = model_helper.ModelHelper("test_net")
+        workspace.RunNetOnce(test_model.param_init_net)
+        workspace.CreateNet(test_model.net)
+        load_model_path = '/home/murilo/PycharmProjects/BreakHis/results/BreakHis40X_fold1/squeezenet_1.mdl'
+        LoadModel(load_model_path)
+        dataset = CancerDataset(split='fold1', dataset_name=args.dataset_name, nr_classes=args.nr_classes)
+        device_option = SetRunGPU(test_model)
+        TestModel(dataset, test_model, device_option, args)
 
-        # Save parameters
-        parameters_file = os.path.join(args.output_dir, args.experiment_name, 'parameters.txt')
-        SaveFileInformation(parameters_file, args)
+    else:
+        base_experiment_name = args.experiment_name
+        #data_set_shuffle_seeds = args.dataset_shuffle_seeds.split(',')
+        for trial in range(0, args.test_trials):
+            args.experiment_name = base_experiment_name + '_fold' + str(trial+1)
+
+            # Save parameters
+            parameters_file = os.path.join(args.output_dir, args.experiment_name, 'parameters.txt')
+            SaveFileInformation(parameters_file, args)
+
+            train_model = ModelConstruction(args)
+            device_option = SetRunGPU(train_model)
+            fold = 'fold'+str(trial+1)
+            dataset = CancerDataset(split=fold, dataset_name=args.dataset_name, nr_classes=args.nr_classes)
+            train_file = os.path.join(args.output_dir, args.experiment_name, 'train.txt')
+            SaveFileInformation(train_file, dataset.X_train)
+            test_file = os.path.join(args.output_dir, args.experiment_name, 'test.txt')
+            SaveFileInformation(test_file, dataset.X_test)
 
 
-        train_model = ModelConstruction(args)
-        device_option = SetRunGPU(train_model)
-
-        data_set_seed = int(data_set_shuffle_seeds[trial])
-        dataset = CancerDataset(dataset_name=args.dataset_name, nr_classes=args.nr_classes, randon_state=data_set_seed)
-        train_file = os.path.join(args.output_dir, args.experiment_name, 'train.txt')
-        SaveFileInformation(train_file, dataset.X_train)
-        test_file = os.path.join(args.output_dir, args.experiment_name, 'test.txt')
-        SaveFileInformation(test_file, dataset.X_test)
-
-
-        losses = Finetuning(dataset, train_model, device_option, args.num_epochs, args.batch_size)
-        #PlotLearintProgress(losses)
-        deploy_model = DeployModel(device_option, args.predict_net)
-        TestModel(dataset, deploy_model, device_option, args)
+            losses = Finetuning(dataset, train_model, device_option, args)
+            #PlotLearintProgress(losses)
+            deploy_model = DeployModel(device_option, args.predict_net)
+            TestModel(dataset, deploy_model, device_option, args)
 
 
 if __name__ == '__main__':
